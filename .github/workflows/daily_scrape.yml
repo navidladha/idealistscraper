@@ -68,10 +68,16 @@ jobs:
                   resp = client.get(f"{BASE_URL}{url_path}", headers=HEADERS, timeout=15)
                   html = resp.text
                   apply_url, contact_email = "", ""
-                  m = re.search(r'applyUrl.{1,6}(https?://[^\s"\\\\]+)', html                 
-                  if m: apply_url = m.group(1)
-                  m = re.search(r'"contactEmail","([^"@]+@[^"]+)"', html)
-                  if m: contact_email = m.group(1)
+                  idx = html.find('applyUrl')
+                  if idx >= 0:
+                      chunk = html[idx:idx+100]
+                      m = re.search(r'https?://[^\s"\\]+', chunk)
+                      if m: apply_url = m.group(0)
+                  idx = html.find('contactEmail')
+                  if idx >= 0:
+                      chunk = html[idx:idx+100]
+                      m = re.search(r'[\w.+-]+@[\w.-]+', chunk)
+                      if m: contact_email = m.group(0)
                   return apply_url, contact_email
               except Exception as e:
                   print(f"  Enrich error: {e}")
