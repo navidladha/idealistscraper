@@ -8,7 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Set up Python
@@ -21,7 +21,6 @@ jobs:
 
       - name: Run scraper
         env:
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: |
@@ -30,18 +29,13 @@ jobs:
           from datetime import datetime, timezone
           from google.oauth2.service_account import Credentials
 
-          APIFY_TOKEN = os.environ["APIFY_TOKEN"]
           GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
           GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-          APIFY_ENDPOINT = "https://api.apify.com/v2/acts/santamaria-automations~idealist-scraper/run-sync-get-dataset-items"
-          APIFY_INPUT = {
-              "searchUrls": ["https://www.idealist.org/en/jobs?hasSalary=true&locationType=REMOTE"],
-              "maxResultsPerQuery": 200,
-              "maxResults": 200,
-              "includeCompanyInfo": False,
-              "maxConcurrency": 5,
-          }
+          ALGOLIA_APP_ID = "NSV3AUESS7"
+          ALGOLIA_API_KEY = "c2730ea10ab82787f2f3cc961e8c1e06"
+          ALGOLIA_INDEX = "idealist7-production"
+          ALGOLIA_URL = f"https://{ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/*/queries"
 
           SHEET_COLUMNS = [
               "id", "title", "company", "location", "location_type",
@@ -57,12 +51,91 @@ jobs:
               if val is None: return ""
               return str(val)
 
-          print(f"[{now_iso()}] Calling Apify...")
-          with httpx.Client(timeout=300) as client:
-              resp = client.post(APIFY_ENDPOINT, params={"token": APIFY_TOKEN}, json=APIFY_INPUT)
-              resp.raise_for_status()
-              jobs = resp.json()
-          print(f"Apify returned {len(jobs)} jobs.")
+          def fetch_all_jobs():
+              headers = {
+                  "x-algolia-api-key": ALGOLIA_API_KEY,
+                  "x-algolia-application-id": ALGOLIA_APP_ID,
+                  "Content-Type": "application/json",
+              }
+              all_hits = []
+              page = 0
+              total_pages = 1
+
+              with httpx.Client(timeout=30) as client:
+                  while page < total_pages:
+                      body = {
+                          "requests": [{
+                              "indexName": ALGOLIA_INDEX,
+                              "params": (
+                                  f"filters=type%3AJOB%20AND%20locationType%3AREMOTE%20AND%20hasSalary%3Atrue"
+                                  f"&hitsPerPage=200&page={page}"
+                              ),
+                          }]
+                      }
+                      resp = client.post(ALGOLIA_URL, headers=headers, json=body)
+                      resp.raise_for_status()
+                      data = resp.json()
+                      results = data.get("results", [{}])[0]
+                      hits = results.get("hits", [])
+                      total_pages = results.get("nbPages", 1)
+                      all_hits.extend(hits)
+                      print(f"Page {page+1}/{total_pages}: {len(hits)} jobs")
+                      page += 1
+
+              return all_hits
+
+          def parse_job(hit, scraped_at):
+              org = hit.get("organization") or {}
+              salary = hit.get("salary") or {}
+              salary_min = salary.get("min") or ""
+              salary_max = salary.get("max") or ""
+              salary_period = (salary.get("period") or "").lower()
+              def fmt(n):
+                  try:
+                      n = int(n)
+                      return f"${n//1000}k" if n >= 1000 else f"${n}"
+                  except: return str(n)
+              if salary_min and salary_max:
+                  salary_text = f"{fmt(salary_min)} - {fmt(salary_max)}/{salary_period}" if salary_period else f"{fmt(salary_min)} - {fmt(salary_max)}"
+              elif salary_min or salary_max:
+                  salary_text = fmt(salary_min or salary_max)
+              else:
+                  salary_text = ""
+
+              loc = hit.get("location") or {}
+              city = loc.get("city") or hit.get("city") or ""
+              state = loc.get("stateCode") or hit.get("state") or ""
+              country = loc.get("countryCode") or hit.get("country") or ""
+              location = ", ".join(filter(None, [city, state, country]))
+
+              slug = hit.get("slug") or str(hit.get("objectID") or "")
+              source_url = f"https://www.idealist.org/en/job/{slug}" if slug else ""
+
+              posted_raw = hit.get("publishedAt") or hit.get("postedAt") or ""
+              try:
+                  posted_at = datetime.fromtimestamp(int(posted_raw), tz=timezone.utc).isoformat() if str(posted_raw).isdigit() else str(posted_raw)
+              except:
+                  posted_at = str(posted_raw)
+
+              return {
+                  "id": str(hit.get("objectID") or hit.get("id") or ""),
+                  "title": hit.get("title") or "",
+                  "company": org.get("name") or hit.get("orgName") or "",
+                  "location": location,
+                  "location_type": (hit.get("locationType") or "").lower(),
+                  "tags": clean(hit.get("functions") or hit.get("tags") or []),
+                  "job_type": clean(hit.get("employmentType") or hit.get("jobType") or []),
+                  "contact_email": hit.get("contactEmail") or "",
+                  "apply_url": hit.get("applicationUrl") or hit.get("applyUrl") or source_url,
+                  "salary_text": salary_text,
+                  "posted_at": posted_at,
+                  "source_platform": "idealist.org",
+                  "scraped_at": scraped_at,
+              }
+
+          print(f"[{now_iso()}] Starting scrape...")
+          hits = fetch_all_jobs()
+          print(f"Total jobs: {len(hits)}")
 
           creds = Credentials.from_service_account_info(
               json.loads(GOOGLE_CREDS_JSON),
@@ -81,20 +154,16 @@ jobs:
 
           scraped_at = now_iso()
           new_rows = []
-          for job in jobs:
-              job_id = str(job.get("id") or "")
-              if not job_id or job_id in existing_ids:
+          for hit in hits:
+              job = parse_job(hit, scraped_at)
+              if not job["id"] or job["id"] in existing_ids:
                   continue
-              row = [clean(job.get(col, "")) for col in SHEET_COLUMNS]
-              idx = SHEET_COLUMNS.index("scraped_at")
-              if not row[idx]: row[idx] = scraped_at
-              new_rows.append(row)
+              new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
 
           if new_rows:
               ws.append_rows(new_rows, value_input_option="RAW")
               print(f"Added {len(new_rows)} new jobs.")
           else:
               print("No new jobs found.")
-
           print("Done.")
           EOF
