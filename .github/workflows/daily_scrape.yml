@@ -135,6 +135,9 @@ jobs:
 
           print(f"[{now_iso()}] Starting scrape...")
           hits = fetch_all_jobs()
+          if hits:
+    print("Sample hit keys:", list(hits[0].keys()))
+    print("Sample hit:", json.dumps(hits[0], indent=2)[:2000])
           print(f"Total jobs: {len(hits)}")
 
           creds = Credentials.from_service_account_info(
