@@ -25,7 +25,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: |
           python3 << 'EOF'
-          import json, os, httpx, gspread
+          import json, os, re, time, httpx, gspread
           from datetime import datetime, timezone
           from google.oauth2.service_account import Credentials
 
@@ -36,6 +36,8 @@ jobs:
           ALGOLIA_API_KEY = "c2730ea10ab82787f2f3cc961e8c1e06"
           ALGOLIA_INDEX = "idealist7-production"
           ALGOLIA_URL = f"https://{ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/*/queries"
+          BASE_URL = "https://www.idealist.org"
+          HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
           SHEET_COLUMNS = [
               "id", "title", "company", "location", "location_type",
@@ -46,87 +48,75 @@ jobs:
           def now_iso():
               return datetime.now(timezone.utc).isoformat()
 
-          def clean(val):
-              if isinstance(val, list): return ", ".join(str(v) for v in val)
-              if val is None: return ""
-              return str(val)
-
-          def fetch_all_jobs():
+          def fetch_recent_jobs():
               headers = {
                   "x-algolia-api-key": ALGOLIA_API_KEY,
                   "x-algolia-application-id": ALGOLIA_APP_ID,
                   "Content-Type": "application/json",
               }
-              all_hits = []
-              page = 0
-              total_pages = 1
-
+              body = {"requests": [{"indexName": ALGOLIA_INDEX, "params": "filters=type%3AJOB%20AND%20locationType%3AREMOTE%20AND%20hasSalary%3Atrue&hitsPerPage=100&page=0"}]}
               with httpx.Client(timeout=30) as client:
-                  while page < total_pages:
-                      body = {
-                          "requests": [{
-                              "indexName": ALGOLIA_INDEX,
-                              "params": (
-                                  f"filters=type%3AJOB%20AND%20locationType%3AREMOTE%20AND%20hasSalary%3Atrue"
-                                  f"&hitsPerPage=200&page={page}"
-                              ),
-                          }]
-                      }
-                      resp = client.post(ALGOLIA_URL, headers=headers, json=body)
-                      resp.raise_for_status()
-                      data = resp.json()
-                      results = data.get("results", [{}])[0]
-                      hits = results.get("hits", [])
-                      total_pages = results.get("nbPages", 1)
-                      all_hits.extend(hits)
-                      print(f"Page {page+1}/{total_pages}: {len(hits)} jobs")
-                      page += 1
+                  resp = client.post(ALGOLIA_URL, headers=headers, json=body)
+                  resp.raise_for_status()
+                  data = resp.json()
+              hits = data.get("results", [{}])[0].get("hits", [])
+              print(f"Fetched {len(hits)} recent jobs from Algolia.")
+              return hits
 
-              return all_hits
+          def enrich_job(client, url_path):
+              try:
+                  resp = client.get(f"{BASE_URL}{url_path}", headers=HEADERS, timeout=15)
+                  html = resp.text
+                  apply_url, contact_email = "", ""
+                  m = re.search(r'"applyUrl","(https?://[^"]+)"', html)
+                  if m: apply_url = m.group(1)
+                  m = re.search(r'"contactEmail","([^"@]+@[^"]+)"', html)
+                  if m: contact_email = m.group(1)
+                  return apply_url, contact_email
+              except Exception as e:
+                  print(f"  Enrich error: {e}")
+                  return "", ""
 
-          def parse_job(hit, scraped_at):
-              org = hit.get("organization") or {}
-              salary = hit.get("salary") or {}
-              salary_min = salary.get("min") or ""
-              salary_max = salary.get("max") or ""
-              salary_period = (salary.get("period") or "").lower()
+          def parse_job(hit, apply_url, contact_email, scraped_at):
+              city = hit.get("city") or ""
+              state = hit.get("state") or ""
+              country = hit.get("country") or hit.get("remoteCountry") or ""
+              location = ", ".join(filter(None, [city, state, country]))
+
+              salary_min = hit.get("salaryMinimum") or ""
+              salary_max = hit.get("salaryMaximum") or ""
+              salary_period = (hit.get("salaryPeriod") or "").lower()
               def fmt(n):
                   try:
-                      n = int(n)
-                      return f"${n//1000}k" if n >= 1000 else f"${n}"
+                      n = float(n)
+                      return f"${int(n)//1000}k" if n >= 1000 else f"${int(n)}"
                   except: return str(n)
               if salary_min and salary_max:
-                  salary_text = f"{fmt(salary_min)} - {fmt(salary_max)}/{salary_period}" if salary_period else f"{fmt(salary_min)} - {fmt(salary_max)}"
+                  salary_text = f"{fmt(salary_min)} - {fmt(salary_max)}/{salary_period}"
               elif salary_min or salary_max:
                   salary_text = fmt(salary_min or salary_max)
               else:
                   salary_text = ""
 
-              loc = hit.get("location") or {}
-              city = loc.get("city") or hit.get("city") or ""
-              state = loc.get("stateCode") or hit.get("state") or ""
-              country = loc.get("countryCode") or hit.get("country") or ""
-              location = ", ".join(filter(None, [city, state, country]))
-
-              slug = hit.get("slug") or str(hit.get("objectID") or "")
-              source_url = f"https://www.idealist.org/en/job/{slug}" if slug else ""
-
-              posted_raw = hit.get("publishedAt") or hit.get("postedAt") or ""
+              published = hit.get("published") or ""
               try:
-                  posted_at = datetime.fromtimestamp(int(posted_raw), tz=timezone.utc).isoformat() if str(posted_raw).isdigit() else str(posted_raw)
+                  posted_at = datetime.fromtimestamp(int(published), tz=timezone.utc).isoformat()
               except:
-                  posted_at = str(posted_raw)
+                  posted_at = str(published)
+
+              url_en = (hit.get("url") or {}).get("en") or ""
+              fallback_url = f"{BASE_URL}{url_en}" if url_en else ""
 
               return {
-                  "id": str(hit.get("objectID") or hit.get("id") or ""),
-                  "title": hit.get("title") or "",
-                  "company": org.get("name") or hit.get("orgName") or "",
+                  "id": str(hit.get("objectID") or ""),
+                  "title": hit.get("name") or "",
+                  "company": hit.get("orgName") or "",
                   "location": location,
                   "location_type": (hit.get("locationType") or "").lower(),
-                  "tags": clean(hit.get("functions") or hit.get("tags") or []),
-                  "job_type": clean(hit.get("employmentType") or hit.get("jobType") or []),
-                  "contact_email": hit.get("contactEmail") or "",
-                  "apply_url": hit.get("applicationUrl") or hit.get("applyUrl") or source_url,
+                  "tags": ", ".join(hit.get("keywords") or []),
+                  "job_type": ", ".join(hit.get("jobType") or []),
+                  "contact_email": contact_email,
+                  "apply_url": apply_url or fallback_url,
                   "salary_text": salary_text,
                   "posted_at": posted_at,
                   "source_platform": "idealist.org",
@@ -134,8 +124,7 @@ jobs:
               }
 
           print(f"[{now_iso()}] Starting scrape...")
-          hits = fetch_all_jobs()
-          print(f"Total jobs: {len(hits)}")
+          hits = fetch_recent_jobs()
 
           creds = Credentials.from_service_account_info(
               json.loads(GOOGLE_CREDS_JSON),
@@ -150,20 +139,22 @@ jobs:
               ws.append_row(SHEET_COLUMNS)
 
           existing_ids = set(ws.col_values(1)[1:])
-          print(f"Sheet has {len(existing_ids)} existing jobs.")
+          new_hits = [h for h in hits if str(h.get("objectID") or "") not in existing_ids]
+          print(f"Existing: {len(existing_ids)} | New: {len(new_hits)}")
 
-          scraped_at = now_iso()
-          new_rows = []
-          for hit in hits:
-              job = parse_job(hit, scraped_at)
-              if not job["id"] or job["id"] in existing_ids:
-                  continue
-              new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
-
-          if new_rows:
+          if not new_hits:
+              print("No new jobs. Done.")
+          else:
+              scraped_at = now_iso()
+              new_rows = []
+              with httpx.Client(follow_redirects=True) as client:
+                  for i, hit in enumerate(new_hits):
+                      url_en = (hit.get("url") or {}).get("en") or ""
+                      apply_url, contact_email = enrich_job(client, url_en)
+                      job = parse_job(hit, apply_url, contact_email, scraped_at)
+                      new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
+                      time.sleep(0.3)
               ws.append_rows(new_rows, value_input_option="RAW")
               print(f"Added {len(new_rows)} new jobs.")
-          else:
-              print("No new jobs found.")
           print("Done.")
           EOF
