@@ -11,9 +11,6 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -27,4 +24,83 @@ jobs:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-        run: python scraper.py
+        run: |
+          python3 << 'EOF'
+          import json, os, httpx, gspread
+          from datetime import datetime, timezone
+          from google.oauth2.service_account import Credentials
+
+          APIFY_TOKEN = os.environ["APIFY_TOKEN"]
+          GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+          GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+
+          APIFY_ENDPOINT = "https://api.apify.com/v2/acts/santamaria-automations~idealist-scraper/run-sync-get-dataset-items"
+          APIFY_INPUT = {
+              "searchUrls": ["https://www.idealist.org/en/jobs?hasSalary=true&locationType=REMOTE"],
+              "maxResultsPerQuery": 500,
+              "maxResults": 0,
+              "includeCompanyInfo": True,
+              "maxConcurrency": 5,
+          }
+
+          SHEET_COLUMNS = [
+              "id","title","company","company_logo_url","company_profile_url","company_id",
+              "company_website","company_description","company_address","company_phone",
+              "company_email","company_joined","company_job_count","location","city","state",
+              "country","location_type","remote_ok","tags","areas_of_focus","job_type",
+              "org_type","professional_level","education","description_full","contact_email",
+              "contact_phone","contact_website","apply_url","application_deadline",
+              "salary_min","salary_max","salary_currency","salary_period","salary_text",
+              "salary_notes","is_active","posted_at","source_url","source_platform",
+              "search_query","scraped_at",
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def clean(val):
+              if isinstance(val, list): return ", ".join(str(v) for v in val)
+              if val is None: return ""
+              return str(val)
+
+          print(f"[{now_iso()}] Calling Apify...")
+          with httpx.Client(timeout=300) as client:
+              resp = client.post(APIFY_ENDPOINT, params={"token": APIFY_TOKEN}, json=APIFY_INPUT)
+              resp.raise_for_status()
+              jobs = resp.json()
+          print(f"Apify returned {len(jobs)} jobs.")
+
+          creds = Credentials.from_service_account_info(
+              json.loads(GOOGLE_CREDS_JSON),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"],
+          )
+          gc = gspread.authorize(creds)
+          sh = gc.open_by_key(GOOGLE_SHEET_ID)
+          try:
+              ws = sh.worksheet("Jobs")
+          except gspread.WorksheetNotFound:
+              ws = sh.add_worksheet("Jobs", rows=10000, cols=len(SHEET_COLUMNS))
+              ws.append_row(SHEET_COLUMNS)
+
+          existing_ids = set(ws.col_values(1)[1:])
+          print(f"Sheet has {len(existing_ids)} existing jobs.")
+
+          scraped_at = now_iso()
+          new_rows = []
+          for job in jobs:
+              job_id = str(job.get("id") or "")
+              if not job_id or job_id in existing_ids:
+                  continue
+              row = [clean(job.get(col, "")) for col in SHEET_COLUMNS]
+              idx = SHEET_COLUMNS.index("scraped_at")
+              if not row[idx]: row[idx] = scraped_at
+              new_rows.append(row)
+
+          if new_rows:
+              ws.append_rows(new_rows, value_input_option="RAW")
+              print(f"Added {len(new_rows)} new jobs.")
+          else:
+              print("No new jobs found.")
+
+          print("Done.")
+          EOF
