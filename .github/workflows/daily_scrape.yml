@@ -1,3 +1,27 @@
+name: Daily Idealist Scrape
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install httpx==0.27.0 gspread==6.1.2 google-auth==2.29.0
+
       - name: Run scraper
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
