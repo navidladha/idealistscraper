@@ -54,7 +54,8 @@ jobs:
                   "x-algolia-application-id": ALGOLIA_APP_ID,
                   "Content-Type": "application/json",
               }
-              body = {"requests": [{"indexName": ALGOLIA_INDEX, "params": "filters=type%3AJOB%20AND%20locationType%3AREMOTE%20AND%20hasSalary%3Atrue&hitsPerPage=100&page=0"}]}
+              since = int(datetime.now(timezone.utc).timestamp()) - 86400
+              body = {"requests": [{"indexName": ALGOLIA_INDEX, "params": f"filters=type%3AJOB%20AND%20locationType%3AREMOTE%20AND%20hasSalary%3Atrue%20AND%20published%3E%3D{since}&hitsPerPage=100&page=0"}]}
               with httpx.Client(timeout=30) as client:
                   resp = client.post(ALGOLIA_URL, headers=headers, json=body)
                   resp.raise_for_status()
