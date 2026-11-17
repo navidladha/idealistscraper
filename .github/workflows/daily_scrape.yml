@@ -27,6 +27,7 @@ jobs:
           python3 << 'EOF'
           import json, os, re, time, httpx, gspread
           from datetime import datetime, timezone
+          from urllib.parse import urlparse
           from google.oauth2.service_account import Credentials
 
           GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
@@ -163,7 +164,8 @@ jobs:
                       time.sleep(0.3)
 
                       # --- FILTERS (add more rules here) ---
-                      if "idealist.org" in job["apply_url"].lower():
+                      apply_host = urlparse(job["apply_url"]).netloc.lower()
+                      if apply_host == "idealist.org" or apply_host.endswith(".idealist.org"):
                           skipped += 1
                           continue
 
