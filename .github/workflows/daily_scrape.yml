@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -154,14 +154,23 @@ jobs:
           else:
               scraped_at = now_iso()
               new_rows = []
+              skipped = 0
               with httpx.Client(follow_redirects=True) as client:
                   for i, hit in enumerate(new_hits):
                       url_en = (hit.get("url") or {}).get("en") or ""
                       apply_url, contact_email = enrich_job(client, url_en)
                       job = parse_job(hit, apply_url, contact_email, scraped_at)
-                      new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
                       time.sleep(0.3)
-              ws.append_rows(new_rows, value_input_option="RAW")
-              print(f"Added {len(new_rows)} new jobs.")
+
+                      # --- FILTERS (add more rules here) ---
+                      if "idealist.org" in job["apply_url"].lower():
+                          skipped += 1
+                          continue
+
+                      new_rows.append([job.get(col, "") for col in SHEET_COLUMNS])
+
+              if new_rows:
+                  ws.append_rows(new_rows, value_input_option="RAW")
+              print(f"Added {len(new_rows)} new jobs. Skipped {skipped} (filtered out).")
           print("Done.")
           EOF
